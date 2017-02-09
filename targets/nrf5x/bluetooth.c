@@ -55,10 +55,6 @@
 
 #define ADVERTISING_INTERVAL            MSEC_TO_UNITS(375, UNIT_0_625_MS)           /**< The advertising interval (in units of 0.625 ms). */
 #define APP_ADV_TIMEOUT_IN_SECONDS      180                                         /**< The advertising timeout (in units of seconds). */
-#define MIN_CONN_INTERVAL               MSEC_TO_UNITS(7.5, UNIT_1_25_MS)             /**< Minimum acceptable connection interval (7.5 ms), Connection interval uses 1.25 ms units. */
-#define MAX_CONN_INTERVAL               MSEC_TO_UNITS(20, UNIT_1_25_MS)             /**< Maximum acceptable connection interval (20 ms (was 75)), Connection interval uses 1.25 ms units. */
-#define SLAVE_LATENCY                   0                                           /**< Slave latency. */
-#define CONN_SUP_TIMEOUT                MSEC_TO_UNITS(4000, UNIT_10_MS)             /**< Connection supervisory timeout (4 seconds), Supervision Timeout uses 10 ms units. */
 #define FIRST_CONN_PARAMS_UPDATE_DELAY  APP_TIMER_TICKS(5000, APP_TIMER_PRESCALER)  /**< Time from initiating event (connect or start of notification) to first time sd_ble_gap_conn_param_update is called (5 seconds). */
 #define NEXT_CONN_PARAMS_UPDATE_DELAY   APP_TIMER_TICKS(30000, APP_TIMER_PRESCALER) /**< Time between each call to sd_ble_gap_conn_param_update after the first call (30 seconds). */
 #define MAX_CONN_PARAMS_UPDATE_COUNT    3                                           /**< Number of attempts before giving up the connection parameter negotiation. */
@@ -130,6 +126,8 @@ bool jsble_check_error(uint32_t err_code) {
   if (!err_code) return false;
   const char *name = 0;
   if (err_code==NRF_ERROR_INVALID_PARAM) name="INVALID_PARAM";
+  else if (err_code==NRF_ERROR_INVALID_LENGTH) name="INVALID_LENGTH";
+  else if (err_code==NRF_ERROR_INVALID_FLAGS) name="INVALID_FLAGS";
   else if (err_code==NRF_ERROR_DATA_SIZE) name="DATA_SIZE";
   else if (err_code==BLE_ERROR_INVALID_CONN_HANDLE) name="INVALID_CONN_HANDLE";
   if (name) jsExceptionHere(JSET_ERROR, "Got BLE error %s", name);
@@ -217,9 +215,40 @@ bool nus_transmit_string() {
   return idx>0;
 }
 
+/// Radio Notification handler
 void SWI1_IRQHandler(bool radio_evt) {
   if (bleStatus & BLE_NUS_INITED)
     nus_transmit_string();
+  // If we're doing multiple advertising, iterate through advertising options
+  if (bleStatus & BLE_IS_ADVERTISING_MULTIPLE) {
+    int idx = (bleStatus&BLE_ADVERTISING_MULTIPLE_MASK)>>BLE_ADVERTISING_MULTIPLE_SHIFT;
+    JsVar *advData = jsvObjectGetChild(execInfo.hiddenRoot, BLE_NAME_ADVERTISE_DATA, 0);
+    bool ok = true;
+    if (jsvIsArray(advData)) {
+      JsVar *data = jsvGetArrayItem(advData, idx);
+      idx = (idx+1) % jsvGetArrayLength(advData);
+      bleStatus = (bleStatus&~BLE_ADVERTISING_MULTIPLE_MASK) | (idx<<BLE_ADVERTISING_MULTIPLE_SHIFT);
+      JSV_GET_AS_CHAR_ARRAY(dPtr, dLen, data);
+      if (dPtr && dLen) {
+        uint32_t err_code = sd_ble_gap_adv_data_set((uint8_t *)dPtr, dLen, NULL, 0);
+        if (err_code)
+          ok = false; // error setting BLE - disable
+      } else {
+        // Invalid adv data - disable
+        ok = false;
+      }
+      jsvUnLock(data);
+    } else {
+      // no advdata - disable multiple advertising
+      ok = false;
+    }
+    if (!ok) {
+      bleStatus &= ~(BLE_IS_ADVERTISING_MULTIPLE|BLE_ADVERTISING_MULTIPLE_MASK);
+    }
+    jsvUnLock(advData);
+  }
+
+
 #ifndef NRF52
   /* NRF52 has a systick. On nRF51 we just hook on
   to this, since it happens quite often */
@@ -382,13 +411,21 @@ static void on_ble_evt(ble_evt_t * p_ble_evt)
 
       case BLE_EVT_TX_COMPLETE:
         // BLE transmit finished - reset flags
-        //TODO: probably want to figure out *which one* finished?
-        bleStatus &= ~BLE_IS_SENDING;
-        if (bleStatus & BLE_IS_SENDING_HID) {
-          bleStatus &= ~BLE_IS_SENDING_HID;
-          jsiQueueObjectCallbacks(execInfo.root, BLE_HID_SENT_EVENT, 0, 0);
-          jsvObjectSetChild(execInfo.root, BLE_HID_SENT_EVENT, 0); // fire only once
-          jshHadEvent();
+#if CENTRAL_LINK_COUNT>0
+        if (p_ble_evt->evt.common_evt.conn_handle == m_central_conn_handle) {
+          if (bleInTask(BLETASK_CHARACTERISTIC_WRITE))
+            bleCompleteTaskSuccess(BLETASK_CHARACTERISTIC_WRITE, 0);
+        }
+#endif
+        if (p_ble_evt->evt.common_evt.conn_handle == m_conn_handle) {
+          //TODO: probably want to figure out *which one* finished?
+          bleStatus &= ~BLE_IS_SENDING;
+          if (bleStatus & BLE_IS_SENDING_HID) {
+            bleStatus &= ~BLE_IS_SENDING_HID;
+            jsiQueueObjectCallbacks(execInfo.root, BLE_HID_SENT_EVENT, 0, 0);
+            jsvObjectSetChild(execInfo.root, BLE_HID_SENT_EVENT, 0); // fire only once
+            jshHadEvent();
+          }
         }
         break;
 
@@ -500,6 +537,17 @@ static void on_ble_evt(ble_evt_t * p_ble_evt)
               jsvObjectSetChildAndUnLock(o,"uuid", bleUUIDToStr(p_chr->uuid));
               jsvObjectSetChildAndUnLock(o,"handle_value", jsvNewFromInteger(p_chr->handle_value));
               jsvObjectSetChildAndUnLock(o,"handle_decl", jsvNewFromInteger(p_chr->handle_decl));
+              JsVar *p = jsvNewObject();
+              if (p) {
+                jsvObjectSetChildAndUnLock(p,"broadcast",jsvNewFromBool(p_chr->char_props.broadcast));
+                jsvObjectSetChildAndUnLock(p,"read",jsvNewFromBool(p_chr->char_props.read));
+                jsvObjectSetChildAndUnLock(p,"writeWithoutResponse",jsvNewFromBool(p_chr->char_props.write_wo_resp));
+                jsvObjectSetChildAndUnLock(p,"write",jsvNewFromBool(p_chr->char_props.write));
+                jsvObjectSetChildAndUnLock(p,"notify",jsvNewFromBool(p_chr->char_props.notify));
+                jsvObjectSetChildAndUnLock(p,"indicate",jsvNewFromBool(p_chr->char_props.indicate));
+                jsvObjectSetChildAndUnLock(p,"authenticatedSignedWrites",jsvNewFromBool(p_chr->char_props.auth_signed_wr));
+                jsvObjectSetChildAndUnLock(o,"properties", p);
+              }
               // char_props?
               jsvArrayPushAndUnLock(bleTaskInfo, o);
             }
@@ -533,9 +581,23 @@ static void on_ble_evt(ble_evt_t * p_ble_evt)
         }
         break;
       }
-      case BLE_GATTC_EVT_DESC_DISC_RSP:
-        jsiConsolePrintf("DESC\n");
+      case BLE_GATTC_EVT_DESC_DISC_RSP: {
+        // trigger this with sd_ble_gattc_descriptors_discover(conn_handle, &handle_range);
+       /* ble_gattc_evt_desc_disc_rsp_t * p_desc_disc_rsp_evt = &p_ble_evt->evt.gattc_evt.params.desc_disc_rsp;
+        if (p_ble_evt->evt.gattc_evt.gatt_status == BLE_GATT_STATUS_SUCCESS) {
+          // The descriptor was found at the peer.
+          // If the descriptor was a CCCD, then the cccd_handle needs to be populated.
+          uint32_t i;
+          // Loop through all the descriptors to find the CCCD.
+          for (i = 0; i < p_desc_disc_rsp_evt->count; i++) {
+            if (p_desc_disc_rsp_evt->descs[i].uuid.uuid ==
+                BLE_UUID_DESCRIPTOR_CLIENT_CHAR_CONFIG) {
+                  cccd_handle = p_desc_disc_rsp_evt->descs[i].handle;
+            }
+          }
+        }*/
         break;
+      }
 
       case BLE_GATTC_EVT_READ_RSP: if (bleInTask(BLETASK_CHARACTERISTIC_READ)) {
         ble_gattc_evt_read_rsp_t *p_read = &p_ble_evt->evt.gattc_evt.params.read_rsp;
@@ -707,10 +769,16 @@ static void gap_params_init() {
 
     memset(&gap_conn_params, 0, sizeof(gap_conn_params));
 
-    gap_conn_params.min_conn_interval = MIN_CONN_INTERVAL;
-    gap_conn_params.max_conn_interval = MAX_CONN_INTERVAL;
-    gap_conn_params.slave_latency     = SLAVE_LATENCY;
-    gap_conn_params.conn_sup_timeout  = CONN_SUP_TIMEOUT;
+    BLEFlags flags = jsvGetIntegerAndUnLock(jsvObjectGetChild(execInfo.hiddenRoot, BLE_NAME_FLAGS, 0));
+    if (flags & BLE_FLAGS_LOW_POWER) {
+      gap_conn_params.min_conn_interval = MSEC_TO_UNITS(500, UNIT_1_25_MS);   // Minimum acceptable connection interval (7.5 ms)
+      gap_conn_params.max_conn_interval = MSEC_TO_UNITS(1000, UNIT_1_25_MS);    // Maximum acceptable connection interval (20 ms)
+    } else {
+      gap_conn_params.min_conn_interval = MSEC_TO_UNITS(7.5, UNIT_1_25_MS);   // Minimum acceptable connection interval (7.5 ms)
+      gap_conn_params.max_conn_interval = MSEC_TO_UNITS(20, UNIT_1_25_MS);    // Maximum acceptable connection interval (20 ms)
+    }
+    gap_conn_params.slave_latency     = 0;  // Slave Latency in number of connection events
+    gap_conn_params.conn_sup_timeout  = MSEC_TO_UNITS(4000, UNIT_10_MS);    // Connection supervisory timeout (4 seconds)
 
     err_code = sd_ble_gap_ppcp_set(&gap_conn_params);
     APP_ERROR_CHECK(err_code);
@@ -889,7 +957,11 @@ static void ble_stack_init() {
                                                     &ble_enable_params);
     APP_ERROR_CHECK(err_code);
 
+#ifdef NRF52
+    ble_enable_params.common_enable_params.vs_uuid_count = 10;
+#else
     ble_enable_params.common_enable_params.vs_uuid_count = 3;
+#endif
 
     //Check the ram settings against the used number of links
     CHECK_RAM_START_ADDR(CENTRAL_LINK_COUNT, PERIPHERAL_LINK_COUNT);
@@ -1068,6 +1140,11 @@ void jsble_restart_softdevice() {
   JsVar *advOpt = jsvObjectGetChild(execInfo.hiddenRoot, BLE_NAME_ADVERTISE_OPTIONS, 0);
   if (advData || advOpt) jswrap_nrf_bluetooth_setAdvertising(advData, advOpt);
   jsvUnLock2(advData, advOpt);
+
+  // If we had scan response data set, update it
+  JsVar *scanData = jsvObjectGetChild(execInfo.hiddenRoot, BLE_NAME_SCAN_RESPONSE_DATA, 0);
+  if (scanData) jswrap_nrf_bluetooth_setScanResponse(scanData);
+  jsvUnLock(scanData);
 
   // if we were scanning, make sure we restart
   if (bleStatus & BLE_IS_SCANNING) {
@@ -1320,7 +1397,7 @@ void jsble_central_connect(ble_gap_addr_t peer_addr) {
   static ble_gap_conn_params_t   gap_conn_params;
   memset(&gap_conn_params, 0, sizeof(gap_conn_params));
   gap_conn_params.min_conn_interval = MSEC_TO_UNITS(7.5, UNIT_1_25_MS);
-  gap_conn_params.max_conn_interval = MSEC_TO_UNITS(75, UNIT_1_25_MS);
+  gap_conn_params.max_conn_interval = MSEC_TO_UNITS(1000, UNIT_1_25_MS);
   gap_conn_params.slave_latency     = 0;
   gap_conn_params.conn_sup_timeout  = MSEC_TO_UNITS(4000, UNIT_10_MS);
 
@@ -1368,9 +1445,20 @@ void jsble_central_characteristicWrite(JsVar *characteristic, char *dataPtr, siz
     return bleCompleteTaskFailAndUnLock(BLETASK_CHARACTERISTIC_WRITE, jsvNewFromString("Not connected"));
 
   uint16_t handle = jsvGetIntegerAndUnLock(jsvObjectGetChild(characteristic, "handle_value", 0));
+  bool writeWithoutResponse = false;
+  JsVar *properties = jsvObjectGetChild(characteristic, "properties", 0);
+  if (properties) {
+    writeWithoutResponse = jsvGetBoolAndUnLock(jsvObjectGetChild(properties, "writeWithoutResponse", 0));
+    jsvUnLock(properties);
+  }
+
+
   ble_gattc_write_params_t write_params;
   memset(&write_params, 0, sizeof(write_params));
-  write_params.write_op = BLE_GATT_OP_WRITE_REQ;
+  if (writeWithoutResponse)
+    write_params.write_op = BLE_GATT_OP_WRITE_CMD; // write without response
+  else
+    write_params.write_op = BLE_GATT_OP_WRITE_REQ; // write with response
   // BLE_GATT_OP_WRITE_REQ ===> BLE_GATTC_EVT_WRITE_RSP (write with response)
   // or BLE_GATT_OP_WRITE_CMD ===> BLE_EVT_TX_COMPLETE (simple write)
   // or send multiple BLE_GATT_OP_PREP_WRITE_REQ,...,BLE_GATT_OP_EXEC_WRITE_REQ (with offset + 18 bytes in each for 'long' write)

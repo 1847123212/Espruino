@@ -187,7 +187,7 @@ Called when a host device disconnects from Espruino.
   "type" : "event",
   "class" : "NRF",
   "name" : "servicesDiscover",
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 Called with discovered services when discovery is finished
  */
@@ -195,7 +195,7 @@ Called with discovered services when discovery is finished
   "type" : "event",
   "class" : "NRF",
   "name" : "characteristicsDiscover",
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 Called with discovered characteristics when discovery is finished
  */
@@ -204,7 +204,7 @@ Called with discovered characteristics when discovery is finished
   "type" : "event",
   "class" : "NRF",
   "name" : "NFCon",
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 Called when an NFC field is detected
  */
@@ -212,7 +212,7 @@ Called when an NFC field is detected
   "type" : "event",
   "class" : "NRF",
   "name" : "NFCoff",
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 Called when an NFC field is no longer detected
  */
@@ -229,7 +229,7 @@ The main part of this is control of Bluetooth Low Energy - both searching for de
   "type" : "object",
   "name" : "Bluetooth",
   "instanceof" : "Serial",
-  "#ifdef" : "BLUETOOTH"
+  "ifdef" : "BLUETOOTH"
 }
 The Bluetooth Serial port - used when data is sent or received over Bluetooth Smart on nRF51/nRF52 chips.
  */
@@ -284,6 +284,32 @@ Enable Bluetooth communications (they are enabled by default)
 void jswrap_nrf_bluetooth_wake() {
   bleStatus &= ~BLE_IS_SLEEPING;
   jsble_advertising_start();
+}
+
+/*JSON{
+    "type" : "staticmethod",
+    "class" : "NRF",
+    "name" : "restart",
+    "generate" : "jswrap_nrf_bluetooth_restart"
+}
+Restart the Bluetooth softdevice (if there is currently a BLE connection,
+it will queue a restart to be done when the connection closes).
+
+You shouldn't need to call this function in normal usage. However, Nordic's
+BLE softdevice has some settings that cannot be reset. For example there
+are only a certain number of unique UUIDs. Once these are all used the
+only option is to restart the softdevice to clear them all out.
+*/
+void jswrap_nrf_bluetooth_restart() {
+  if (jsble_has_connection()) {
+    jsiConsolePrintf("BLE Connected, queueing BLE restart for later\n");
+    bleStatus |= BLE_NEEDS_SOFTDEVICE_RESTART;
+    return;
+  } else {
+    // Not connected, so we can restart now
+    jsble_restart_softdevice();
+    return;
+  }
 }
 
 /*JSON{
@@ -371,6 +397,18 @@ NRF.setAdvertising([0x03,  // Length of Service List
     {interval:100});
 ```
 
+You can even specify an array of arrays, in which case each advertising packet
+will be iterated over in turn - for instance to make your device advertise
+both Eddystone and iBeacon:
+
+```
+NRF.setAdvertising([
+[0x03,0x03,0xAA,0xFE,0x13,0x16,0xAA,0xFE,0x10,0xF8,0x03,'g','o','o','.','g','l','/','C','H','o','J','H','0'],
+[....],
+[....],
+],{interval:500});
+```
+
 `options` is an object, which can contain:
 
 ```
@@ -435,8 +473,23 @@ void jswrap_nrf_bluetooth_setAdvertising(JsVar *data, JsVar *options) {
     return;
   }
 
-  if (jsvIsArray(data)) {
+  if (jsvIsArray(data) || jsvIsArrayBuffer(data)) {
     // raw data...
+    // Check if it's nested arrays - if so we alternate between advertising types
+    bleStatus &= ~(BLE_IS_ADVERTISING_MULTIPLE|BLE_ADVERTISING_MULTIPLE_MASK);
+    if (jsvIsArray(data)) {
+      JsVar *item = jsvGetArrayItem(data, 0);
+      if (jsvIsArray(item) || jsvIsArrayBuffer(item)) {
+        // nested - enable multiple advertising - start at index 0
+        bleStatus |= BLE_IS_ADVERTISING_MULTIPLE;
+        // start with the first element
+        jsvUnLock(data);
+        data = item;
+        item = 0;
+      } else
+        jsvUnLock(item);
+    }
+
     JSV_GET_AS_CHAR_ARRAY(dPtr, dLen, data);
     if (!dPtr) {
       jsExceptionHere(JSET_TYPEERROR, "Unable to convert data argument to an array");
@@ -485,6 +538,43 @@ void jswrap_nrf_bluetooth_setAdvertising(JsVar *data, JsVar *options) {
 /*JSON{
     "type" : "staticmethod",
     "class" : "NRF",
+    "name" : "setScanResponse",
+    "generate" : "jswrap_nrf_bluetooth_setScanResponse",
+    "params" : [
+      ["data","JsVar","The data to for the scan response"]
+    ]
+}
+
+The raw scan response data should be supplied as an array. For example to return "Sample" for the device name:
+
+```
+NRF.setScanResponse([0x07,  // Length of Data
+  0x09,  // Param: Complete Local Name
+  'S', 'a', 'm', 'p', 'l', 'e']);
+```
+*/
+void jswrap_nrf_bluetooth_setScanResponse(JsVar *data) {
+  uint32_t err_code;
+  
+  jsvObjectSetOrRemoveChild(execInfo.hiddenRoot, BLE_NAME_SCAN_RESPONSE_DATA, data);
+
+  if (jsvIsArray(data) || jsvIsArrayBuffer(data)) {
+    JSV_GET_AS_CHAR_ARRAY(dPtr, dLen, data);
+    if (!dPtr) {
+      jsExceptionHere(JSET_TYPEERROR, "Unable to convert data argument to an array");
+      return;
+    }
+
+    err_code = sd_ble_gap_adv_data_set(NULL, 0, (uint8_t *)dPtr, dLen);
+    jsble_check_error(err_code);
+  } else if (!jsvIsUndefined(data)) {
+    jsExceptionHere(JSET_TYPEERROR, "Expecting array-like object or undefined, got %t", data);
+  }
+}
+
+/*JSON{
+    "type" : "staticmethod",
+    "class" : "NRF",
     "name" : "setServices",
     "generate" : "jswrap_nrf_bluetooth_setServices",
     "params" : [
@@ -494,6 +584,9 @@ void jswrap_nrf_bluetooth_setAdvertising(JsVar *data, JsVar *options) {
 }
 
 Change the services and characteristics Espruino advertises.
+
+If you want to **change** the value of a characteristic, you need
+to use `NRF.updateServices()` instead
 
 To expose some information on Characteristic `ABCD` on service `BCDE` you could do:
 
@@ -619,16 +712,7 @@ void jswrap_nrf_bluetooth_setServices(JsVar *data, JsVar *options) {
 
   // work out whether to apply changes
   if (bleStatus & (BLE_SERVICES_WERE_SET|BLE_NEEDS_SOFTDEVICE_RESTART)) {
-    if (jsble_has_connection()) {
-      // Defer setting services until we have no active connection
-      jsiConsolePrintf("BLE Connected, so queueing service update for later\n");
-      bleStatus |= BLE_NEEDS_SOFTDEVICE_RESTART;
-      return;
-    } else {
-      // Not connected, but we can update services now
-      jsble_restart_softdevice();
-      return;
-    }
+    jswrap_nrf_bluetooth_restart();
   }
   /* otherwise, we can set the services now, since we're only adding
    * and not changing anything we don't need a restart. */
@@ -845,7 +929,7 @@ void jswrap_nrf_bluetooth_setScan_cb(JsVar *callback, JsVar *adv) {
             }
           } else if (field_type == BLE_GAP_AD_TYPE_16BIT_SERVICE_UUID_MORE_AVAILABLE ||
                      field_type == BLE_GAP_AD_TYPE_16BIT_SERVICE_UUID_COMPLETE) {
-            JsVar *s = jsvVarPrintf("%04x", *(uint16_t*)&dPtr[i+2]);
+            JsVar *s = jsvVarPrintf("%04x", UNALIGNED_UINT16(&dPtr[i+2]));
             jsvArrayPushAndUnLock(services, s);
           } else if (field_type == BLE_GAP_AD_TYPE_128BIT_SERVICE_UUID_MORE_AVAILABLE ||
                      field_type == BLE_GAP_AD_TYPE_128BIT_SERVICE_UUID_COMPLETE) {
@@ -993,20 +1077,18 @@ void jswrap_nrf_bluetooth_findDevices(JsVar *callback, JsVar *timeout) {
 }
 
 Start/stop listening for RSSI values on the currently active connection
-
-RSSI is the 'Received Signal Strength Indication' in dBm
+(where This device is a peripheral and is being connected to by a 'central' device)
 
 ```
 // Start scanning
 NRF.setRSSIHandler(function(rssi) {
-  console.log(rssi);
+  console.log(rssi); // prints -85 (or similar)
 });
-// prints -85 (or similar)
-
 // Stop Scanning
 NRF.setRSSIHandler();
 ```
 
+RSSI is the 'Received Signal Strength Indication' in dBm
 */
 void jswrap_nrf_bluetooth_setRSSIHandler(JsVar *callback) {
   // set the callback event variable
@@ -1037,11 +1119,49 @@ void jswrap_nrf_bluetooth_setTxPower(JsVarInt pwr) {
   jsble_check_error(err_code);
 }
 
+
+/*JSON{
+    "type" : "staticmethod",
+    "class" : "NRF",
+    "name" : "setLowPowerConnection",
+    "generate" : "jswrap_nrf_bluetooth_setLowPowerConnection",
+    "params" : [
+      ["lowPower","bool","Whether the connection is low power or not"]
+    ]
+}
+
+This sets the connection parameters - these affect the transfer speed and
+power usage when the device is connected.
+
+* When not low power, the connection interval is between 7.5 and 20ms
+* When low power, the connection interval is between 500 and 1000ms
+
+When low power connection is enabled, transfers of data over Bluetooth
+will be very slow, however power usage while connected will be drastically
+decreased.
+
+This will only take effect after the connection is disconnected and
+re-established.
+*/
+void jswrap_nrf_bluetooth_setLowPowerConnection(bool lowPower) {
+  BLEFlags oldflags = jsvGetIntegerAndUnLock(jsvObjectGetChild(execInfo.hiddenRoot, BLE_NAME_FLAGS, 0));
+  BLEFlags flags = oldflags;
+  if (lowPower)
+    flags |= BLE_FLAGS_LOW_POWER;
+  else
+    flags &= ~BLE_FLAGS_LOW_POWER;
+  if (flags != oldflags) {
+    jsvObjectSetChildAndUnLock(execInfo.hiddenRoot, BLE_NAME_FLAGS, jsvNewFromInteger(flags));
+    jswrap_nrf_bluetooth_restart();
+  }
+}
+
+
 /*JSON{
     "type" : "staticmethod",
     "class" : "NRF",
     "name" : "nfcURL",
-    "#ifdef" : "NRF52",
+    "ifdef" : "NRF52",
     "generate" : "jswrap_nrf_nfcURL",
     "params" : [
       ["url","JsVar","The URL string to expose on NFC, or `undefined` to disable NFC"]
@@ -1072,7 +1192,6 @@ void jswrap_nrf_nfcURL(JsVar *url) {
   uint32_t err_code;
   /* Turn off NFC */
   jsble_nfc_stop();
-
   JSV_GET_AS_CHAR_ARRAY(urlPtr, urlLen, url);
   if (!urlPtr || !urlLen)
     return jsExceptionHere(JSET_ERROR, "Unable to get URL data");
@@ -1117,8 +1236,58 @@ void jswrap_nrf_nfcURL(JsVar *url) {
 /*JSON{
     "type" : "staticmethod",
     "class" : "NRF",
+    "name" : "nfcRaw",
+    "ifdef" : "NRF52",
+    "generate" : "jswrap_nrf_nfcRaw",
+    "params" : [
+      ["payload","JsVar","The NFC NDEF message to deliver to the reader"]
+    ]
+}
+Enables NFC and starts advertising with Raw data. For example:
+
+```
+NRF.nfcRaw(new Uint8Array([193, 1, 0, 0, 0, 13, 85, 3, 101, 115, 112, 114, 117, 105, 110, 111, 46, 99, 111, 109]));
+// same as NRF.nfcURL("http://espruino.com");
+```
+
+**Note:** This is only available on nRF52-based devices
+*/
+void jswrap_nrf_nfcRaw(JsVar *payload) {
+#ifdef USE_NFC
+  // Check for disabling NFC
+  if (jsvIsUndefined(payload)) {
+    jsvObjectRemoveChild(execInfo.hiddenRoot, "NFC");
+    jsble_nfc_stop();
+    return;
+  }
+
+  /* Turn off NFC */
+  jsble_nfc_stop();
+
+  JSV_GET_AS_CHAR_ARRAY(dataPtr, dataLen, payload);
+  if (!dataPtr || !dataLen)
+    return jsExceptionHere(JSET_ERROR, "Unable to get NFC data");
+
+  /* Create a flat string - we need this to store the NFC data so it hangs around.
+   * Avoid having a static var so we have RAM available if not using NFC */
+  JsVar *flatStr = jsvNewFlatStringOfLength(dataLen);
+  if (!flatStr)
+    return jsExceptionHere(JSET_ERROR, "Unable to create string with NFC data in");
+  jsvObjectSetChild(execInfo.hiddenRoot, "NFC", flatStr);
+  uint8_t *flatStrPtr = (uint8_t*)jsvGetFlatStringPointer(flatStr);
+  jsvUnLock(flatStr);
+  memcpy(flatStrPtr, dataPtr, dataLen);
+
+  // start nfc properly
+  jsble_nfc_start(flatStrPtr, dataLen);
+#endif
+}
+
+/*JSON{
+    "type" : "staticmethod",
+    "class" : "NRF",
     "name" : "sendHIDReport",
-    "#ifdef" : "NRF52",
+    "ifdef" : "NRF52",
     "generate" : "jswrap_nrf_sendHIDReport",
     "params" : [
       ["data","JsVar","Input report data as an array"],
@@ -1145,7 +1314,7 @@ void jswrap_nrf_sendHIDReport(JsVar *data, JsVar *callback) {
     "type" : "staticmethod",
     "class" : "NRF",
     "name" : "requestDevice",
-    "#ifdef" : "NRF52",
+    "ifdef" : "NRF52",
     "generate" : "jswrap_nrf_bluetooth_requestDevice",
     "params" : [
       ["options","JsVar","Options used to filter the device to use"]
@@ -1326,6 +1495,7 @@ JsVar *jswrap_nrf_bluetooth_requestDevice(JsVar *options) {
   return promise;
 #else
   jsExceptionHere(JSET_ERROR, "Unimplemented");
+  return 0;
 #endif
 }
 
@@ -1335,7 +1505,7 @@ JsVar *jswrap_nrf_bluetooth_requestDevice(JsVar *options) {
     "type" : "staticmethod",
     "class" : "NRF",
     "name" : "connect",
-    "#ifdef" : "NRF52",
+    "ifdef" : "NRF52",
     "generate" : "jswrap_nrf_bluetooth_connect",
     "params" : [
       ["mac","JsVar","The MAC address to connect to"]
@@ -1380,6 +1550,7 @@ JsVar *jswrap_nrf_bluetooth_connect(JsVar *mac) {
   return jswrap_nrf_BluetoothRemoteGATTServer_connect(gatt);
 #else
   jsExceptionHere(JSET_ERROR, "Unimplemented");
+  return 0;
 #endif
 }
 
@@ -1387,7 +1558,7 @@ JsVar *jswrap_nrf_bluetooth_connect(JsVar *mac) {
 /*JSON{
   "type" : "class",
   "class" : "BluetoothDevice",
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 Web Bluetooth-style device - get this using `NRF.requestDevice(address)`
 */
@@ -1395,7 +1566,7 @@ Web Bluetooth-style device - get this using `NRF.requestDevice(address)`
     "type" : "property",
     "class" : "BluetoothDevice",
     "name" : "gatt",
-    "#ifdef" : "NRF52",
+    "ifdef" : "NRF52",
     "generate" : "jswrap_BluetoothDevice_gatt",
     "return" : ["JsVar", "A `BluetoothRemoteGATTServer` for this device" ]
 }
@@ -1417,7 +1588,7 @@ JsVar *jswrap_BluetoothDevice_gatt(JsVar *parent) {
     "type" : "method",
     "class" : "BluetoothRemoteGATTServer",
     "name" : "connect",
-    "#ifdef" : "NRF52",
+    "ifdef" : "NRF52",
     "generate" : "jswrap_nrf_BluetoothRemoteGATTServer_connect",
     "return" : ["JsVar", "A Promise that is resolved (or rejected) when the connection is complete" ]
 }
@@ -1450,13 +1621,14 @@ JsVar *jswrap_nrf_BluetoothRemoteGATTServer_connect(JsVar *parent) {
   return 0;
 #else
   jsExceptionHere(JSET_ERROR, "Unimplemented");
+  return 0;
 #endif
 }
 
 /*JSON{
   "type" : "class",
   "class" : "BluetoothRemoteGATTServer",
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 Web Bluetooth-style GATT server - get this using `NRF.connect(address)`
 or `NRF.requestDevice(options)` then `response.gatt.connect`
@@ -1468,7 +1640,7 @@ https://webbluetoothcg.github.io/web-bluetooth/#bluetoothremotegattserver
     "class" : "BluetoothRemoteGATTServer",
     "name" : "disconnect",
     "generate" : "jswrap_BluetoothRemoteGATTServer_disconnect",
-    "#ifdef" : "NRF52"
+    "ifdef" : "NRF52"
 }
 Disconnect from a previously connected BLE device connected with
 `NRF.connect` - this does not disconnect from something that has
@@ -1501,7 +1673,7 @@ void jswrap_BluetoothRemoteGATTServer_disconnect(JsVar *parent) {
   "generate" : "jswrap_BluetoothRemoteGATTServer_getPrimaryService",
   "params" : [ ["service","JsVar","The service UUID"] ],
   "return" : ["JsVar", "A Promise that is resolved (or rejected) when the primary service is found" ],
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 **Note:** This is only available on some devices
 */
@@ -1533,7 +1705,7 @@ JsVar *jswrap_BluetoothRemoteGATTServer_getPrimaryService(JsVar *parent, JsVar *
   "name" : "getPrimaryServices",
   "generate" : "jswrap_BluetoothRemoteGATTServer_getPrimaryServices",
   "return" : ["JsVar", "A Promise that is resolved (or rejected) when the primary services are found" ],
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 **Note:** This is only available on some devices
 */
@@ -1556,7 +1728,7 @@ JsVar *jswrap_BluetoothRemoteGATTServer_getPrimaryServices(JsVar *parent) {
 /*JSON{
   "type" : "class",
   "class" : "BluetoothRemoteGATTService",
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 Web Bluetooth-style GATT service - get this using `BluetoothRemoteGATTServer.getPrimaryService(s)`
 
@@ -1569,7 +1741,7 @@ https://webbluetoothcg.github.io/web-bluetooth/#bluetoothremotegattservice
   "generate" : "jswrap_BluetoothRemoteGATTService_getCharacteristic",
   "params" : [ ["characteristic","JsVar","The characteristic UUID"] ],
   "return" : ["JsVar", "A Promise that is resolved (or rejected) when the characteristic is found" ],
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 **Note:** This is only available on some devices
 */
@@ -1601,7 +1773,7 @@ JsVar *jswrap_BluetoothRemoteGATTService_getCharacteristic(JsVar *parent, JsVar 
   "name" : "getCharacteristics",
   "generate" : "jswrap_BluetoothRemoteGATTService_getCharacteristics",
   "return" : ["JsVar", "A Promise that is resolved (or rejected) when the characteristic is found" ],
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 **Note:** This is only available on some devices
 */
@@ -1625,7 +1797,7 @@ JsVar *jswrap_BluetoothRemoteGATTService_getCharacteristics(JsVar *parent) {
 /*JSON{
   "type" : "class",
   "class" : "BluetoothRemoteGATTCharacteristic",
-  "#ifdef" : "NRF52"
+  "ifdef" : "NRF52"
 }
 Web Bluetooth-style GATT characteristic - get this using `BluetoothRemoteGATTService.getCharacteristic(s)`
 
